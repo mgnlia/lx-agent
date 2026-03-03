@@ -1066,33 +1066,54 @@ func filterCoursesBySemester(courses []canvas.Course, semesterKey string) []canv
 	return out
 }
 
-func dominantEnrollmentTermID(courses []canvas.Course) (int, bool) {
-	counts := make(map[int]int)
-	bestTermID := 0
-	bestCount := 0
-	for _, c := range courses {
-		if c.EnrollmentTermID <= 0 {
-			continue
-		}
-		counts[c.EnrollmentTermID]++
-		if counts[c.EnrollmentTermID] > bestCount {
-			bestCount = counts[c.EnrollmentTermID]
-			bestTermID = c.EnrollmentTermID
-		}
+func semesterBoundsKST(now time.Time) (time.Time, time.Time) {
+	kst := time.FixedZone("KST", 9*3600)
+	base := now.In(kst)
+	year, month := base.Year(), base.Month()
+	if int(month) >= 8 {
+		start := time.Date(year, time.August, 1, 0, 0, 0, 0, kst)
+		end := time.Date(year+1, time.January, 1, 0, 0, 0, 0, kst)
+		return start, end
 	}
-	if bestTermID <= 0 {
-		return 0, false
-	}
-	return bestTermID, true
+	start := time.Date(year, time.January, 1, 0, 0, 0, 0, kst)
+	end := time.Date(year, time.August, 1, 0, 0, 0, 0, kst)
+	return start, end
 }
 
-func filterCoursesByEnrollmentTerm(courses []canvas.Course, termID int) []canvas.Course {
-	if termID <= 0 {
+func filterCoursesBySemesterWindow(courses []canvas.Course, now time.Time) []canvas.Course {
+	start, end := semesterBoundsKST(now)
+	var out []canvas.Course
+	for _, c := range courses {
+		if c.StartAt != nil {
+			if c.StartAt.Before(end) && (c.EndAt == nil || !c.EndAt.Before(start)) {
+				out = append(out, c)
+			}
+			continue
+		}
+		if c.EndAt != nil && !c.EndAt.Before(start) && c.EndAt.Before(end) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func enrollmentTermIDs(courses []canvas.Course) map[int]bool {
+	ids := make(map[int]bool)
+	for _, c := range courses {
+		if c.EnrollmentTermID > 0 {
+			ids[c.EnrollmentTermID] = true
+		}
+	}
+	return ids
+}
+
+func filterCoursesByEnrollmentTerms(courses []canvas.Course, termIDs map[int]bool) []canvas.Course {
+	if len(termIDs) == 0 {
 		return nil
 	}
 	var out []canvas.Course
 	for _, c := range courses {
-		if c.EnrollmentTermID == termID {
+		if termIDs[c.EnrollmentTermID] {
 			out = append(out, c)
 		}
 	}
@@ -1100,18 +1121,23 @@ func filterCoursesByEnrollmentTerm(courses []canvas.Course, termID int) []canvas
 }
 
 func defaultSemesterCoursesForKey(courses []canvas.Course, semesterKey string) []canvas.Course {
+	// Prefer date overlap for the current semester window (language-agnostic).
+	windowMatches := filterCoursesBySemesterWindow(courses, time.Now())
+	if len(windowMatches) > 0 {
+		return windowMatches
+	}
+
 	filtered := filterCoursesBySemester(courses, semesterKey)
 	if len(filtered) == 0 {
 		return courses
 	}
 
-	// If only some courses include semester text in their name/code, expand to
-	// all courses in the same enrollment term so English-titled classes are kept.
-	termID, ok := dominantEnrollmentTermID(filtered)
-	if !ok {
+	// Expand to all matching enrollment terms, not just one dominant term.
+	termIDs := enrollmentTermIDs(filtered)
+	if len(termIDs) == 0 {
 		return filtered
 	}
-	termCourses := filterCoursesByEnrollmentTerm(courses, termID)
+	termCourses := filterCoursesByEnrollmentTerms(courses, termIDs)
 	if len(termCourses) == 0 {
 		return filtered
 	}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "LearningX Telegram CLI"
+  short_description: "Run lx-agent Telegram CLI commands"
+  default_prompt: "Use $learningx-telegram-cli to run lx-agent Telegram/LearningX CLI commands and report the outputs."

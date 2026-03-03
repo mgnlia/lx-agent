@@ -1,4 +1,0 @@
-interface:
-  display_name: "LearningX Telegram Self-Heal"
-  short_description: "Fix Telegram LearningX bot regressions quickly"
-  default_prompt: "Use $learningx-telegram-self-heal to diagnose Telegram LearningX bot issues, apply minimal safe fixes, validate, and deploy."
