@@ -77,6 +77,17 @@ func handleServe(cfg config, client *canvas.Client, logger *slog.Logger) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if !hasCanvasConfig(cfg) {
+		if strings.TrimSpace(cfg.Notifier.Telegram.BotToken) == "" {
+			exitErr(errors.New("serve requires telegram bot token when canvas is not configured"))
+		}
+		logger.Warn("canvas is not configured; starting bot only")
+		if err := runBotLoop(ctx, cfg, client, logger); err != nil && !errors.Is(err, context.Canceled) {
+			exitErr(err)
+		}
+		return
+	}
+
 	if strings.TrimSpace(cfg.Notifier.Telegram.BotToken) == "" {
 		logger.Warn("serve mode without telegram bot token; running monitor only")
 		if err := runMonitorService(ctx, cfg, client, logger); err != nil && !errors.Is(err, context.Canceled) {
@@ -126,8 +137,11 @@ func runBotLoop(ctx context.Context, cfg config, client *canvas.Client, logger *
 	if err != nil {
 		return fmt.Errorf("resolve bot chat id: %w", err)
 	}
-	if allowedChatID == "" {
+	if allowedChatID == "" && hasCanvasConfig(cfg) {
 		return errors.New("chat id not bound; run bind-chat first")
+	}
+	if allowedChatID == "" {
+		logger.Warn("chat is not bound; allowing all chats because canvas is not configured")
 	}
 
 	logger.Info("telegram command bot started", "chat_id", allowedChatID)
@@ -158,7 +172,7 @@ func runBotLoop(ctx context.Context, cfg config, client *canvas.Client, logger *
 					continue
 				}
 				chatID := strconv.FormatInt(u.CallbackQuery.Message.Chat.ID, 10)
-				if chatID != allowedChatID {
+				if allowedChatID != "" && chatID != allowedChatID {
 					_ = answerTelegramCallbackQuery(ctx, botToken, u.CallbackQuery.ID, msg("ko", "권한이 없습니다.", "Unauthorized."))
 					continue
 				}
@@ -184,7 +198,7 @@ func runBotLoop(ctx context.Context, cfg config, client *canvas.Client, logger *
 			}
 
 			chatID := strconv.FormatInt(u.Message.Chat.ID, 10)
-			if chatID != allowedChatID {
+			if allowedChatID != "" && chatID != allowedChatID {
 				_ = sendTelegramBotMessage(ctx, botToken, chatID, "This bot is bound to a different chat.", nil)
 				continue
 			}
@@ -230,7 +244,7 @@ func handleTelegramCommand(ctx context.Context, cfg config, client *canvas.Clien
 		return botResponse{Text: fmt.Sprintf("chat_id=%s\nmonitor_courses=%s\npoll_interval=%s\n언어=%s", chatID, filter, cfg.Monitor.PollInterval, lang)}
 	case "/bind":
 		if strings.TrimSpace(cfg.Database.URL) == "" || strings.TrimSpace(cfg.Canvas.Token) == "" {
-			return botResponse{Text: msg(lang, "바인딩에는 DATABASE_URL과 CANVAS_TOKEN이 필요합니다.", "Binding requires DATABASE_URL and CANVAS_TOKEN.")}
+			return botResponse{Text: msg(lang, "바인딩에는 DATABASE_URL과 config의 canvas.token이 필요합니다.", "Binding requires DATABASE_URL and canvas.token in config.")}
 		}
 		store, err := binding.New(cfg.Database.URL)
 		if err != nil {
@@ -245,8 +259,14 @@ func handleTelegramCommand(ctx context.Context, cfg config, client *canvas.Clien
 		}
 		return botResponse{Text: msg(lang, "현재 채팅을 Canvas 토큰에 바인딩했습니다.", "Bound this chat to the current Canvas token.")}
 	case "/courses":
+		if !hasCanvasConfig(cfg) {
+			return botResponse{Text: msg(lang, "Canvas가 설정되지 않았습니다. 관리자에서 연결 후 다시 시도하세요.", "Canvas is not configured. Connect it in admin first.")}
+		}
 		return botResponse{Text: cmdCourses(ctx, cfg, client, args, lang)}
 	case "/assignments":
+		if !hasCanvasConfig(cfg) {
+			return botResponse{Text: msg(lang, "Canvas가 설정되지 않았습니다. 관리자에서 연결 후 다시 시도하세요.", "Canvas is not configured. Connect it in admin first.")}
+		}
 		if len(args) > 0 {
 			if _, err := strconv.Atoi(args[0]); err == nil {
 				return botResponse{Text: msg(lang, "course_id 직접 입력은 더 이상 필요하지 않습니다. /assignments 를 눌러 강의를 선택하세요.", "Typing course_id is no longer needed. Use /assignments and pick a course.")}
@@ -258,10 +278,19 @@ func handleTelegramCommand(ctx context.Context, cfg config, client *canvas.Clien
 		}
 		return resp
 	case "/upcoming":
+		if !hasCanvasConfig(cfg) {
+			return botResponse{Text: msg(lang, "Canvas가 설정되지 않았습니다. 관리자에서 연결 후 다시 시도하세요.", "Canvas is not configured. Connect it in admin first.")}
+		}
 		return botResponse{Text: cmdUpcoming(ctx, cfg, client, args, lang)}
 	case "/announcements":
+		if !hasCanvasConfig(cfg) {
+			return botResponse{Text: msg(lang, "Canvas가 설정되지 않았습니다. 관리자에서 연결 후 다시 시도하세요.", "Canvas is not configured. Connect it in admin first.")}
+		}
 		return botResponse{Text: cmdAnnouncements(ctx, cfg, client, args, lang)}
 	case "/files":
+		if !hasCanvasConfig(cfg) {
+			return botResponse{Text: msg(lang, "Canvas가 설정되지 않았습니다. 관리자에서 연결 후 다시 시도하세요.", "Canvas is not configured. Connect it in admin first.")}
+		}
 		if len(args) > 0 {
 			if _, err := strconv.Atoi(args[0]); err == nil {
 				return botResponse{Text: msg(lang, "course_id 직접 입력은 더 이상 필요하지 않습니다. /files 를 눌러 강의를 선택하세요.", "Typing course_id is no longer needed. Use /files and pick a course.")}
@@ -293,6 +322,9 @@ func handleTelegramCallback(ctx context.Context, cfg config, client *canvas.Clie
 	}
 
 	if strings.HasPrefix(data, "asg:") {
+		if !hasCanvasConfig(cfg) {
+			return botResponse{Text: msg(lang, "Canvas가 설정되지 않았습니다. 관리자에서 연결 후 다시 시도하세요.", "Canvas is not configured. Connect it in admin first.")}
+		}
 		parts := strings.Split(data, ":")
 		if len(parts) != 3 {
 			return botResponse{Text: msg(lang, "잘못된 선택 데이터입니다.", "Invalid selection payload.")}
@@ -309,6 +341,9 @@ func handleTelegramCallback(ctx context.Context, cfg config, client *canvas.Clie
 	}
 
 	if strings.HasPrefix(data, "fil:") {
+		if !hasCanvasConfig(cfg) {
+			return botResponse{Text: msg(lang, "Canvas가 설정되지 않았습니다. 관리자에서 연결 후 다시 시도하세요.", "Canvas is not configured. Connect it in admin first.")}
+		}
 		parts := strings.Split(data, ":")
 		if len(parts) != 3 {
 			return botResponse{Text: msg(lang, "잘못된 선택 데이터입니다.", "Invalid selection payload.")}

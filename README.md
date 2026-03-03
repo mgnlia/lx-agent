@@ -95,11 +95,9 @@ bun run admin:frontend
 ## Environment Variables
 
 - `CANVAS_URL`
-- `CANVAS_TOKEN`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `DATABASE_URL`
-- `MONITOR_COURSES` (comma-separated course ids)
 - `ADMIN_BACKEND_PORT` (optional; default `8787`)
 
 ## Architecture
@@ -115,7 +113,8 @@ bun run admin:frontend
 ## Notes
 
 - Gemini integration has been removed from this repository.
-- Course filtering can be fixed to a term or subset using `monitor.courses` or `MONITOR_COURSES`.
+- Course filtering can be fixed to a term or subset using `monitor.courses` in config.
+- `serve` can run without Canvas config (Telegram bot only). Canvas commands will return a not-configured message.
 
 ## License
 

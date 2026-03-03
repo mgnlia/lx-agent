@@ -86,27 +86,28 @@ func main() {
 		return
 	}
 
-	if cfg.Canvas.URL == "" || cfg.Canvas.Token == "" {
-		exitErr(errors.New("canvas.url and canvas.token are required (config or env: CANVAS_URL/CANVAS_TOKEN)"))
-	}
-
 	ctx := context.Background()
 	client := canvas.NewClient(cfg.Canvas.URL, cfg.Canvas.Token, logger)
 
 	switch cmd {
 	case "courses":
+		requireCanvasConfig(cfg, cmd)
 		handleCourses(ctx, client)
 	case "assignments":
+		requireCanvasConfig(cfg, cmd)
 		handleAssignments(ctx, client, cmdArgs)
 	case "files":
+		requireCanvasConfig(cfg, cmd)
 		handleFiles(ctx, client, cmdArgs)
 	case "announcements":
+		requireCanvasConfig(cfg, cmd)
 		handleAnnouncements(ctx, client)
 	case "bot":
 		handleBot(cfg, client, logger)
 	case "serve":
 		handleServe(cfg, client, logger)
 	case "once", "run":
+		requireCanvasConfig(cfg, cmd)
 		handleMonitor(cmd, cfg, client, logger)
 	default:
 		exitErr(fmt.Errorf("unknown command: %s", cmd))
@@ -251,7 +252,7 @@ func handleAnnouncements(ctx context.Context, client *canvas.Client) {
 
 func handleBindChat(ctx context.Context, cfg config, args []string) {
 	if strings.TrimSpace(cfg.Canvas.Token) == "" {
-		exitErr(errors.New("bind-chat requires canvas.token (or CANVAS_TOKEN)"))
+		exitErr(errors.New("bind-chat requires canvas.token in config"))
 	}
 	if strings.TrimSpace(cfg.Database.URL) == "" {
 		exitErr(errors.New("bind-chat requires database.url (or DATABASE_URL)"))
@@ -471,9 +472,6 @@ func applyEnvOverrides(cfg *config) {
 	if v := strings.TrimSpace(os.Getenv("CANVAS_URL")); v != "" {
 		cfg.Canvas.URL = v
 	}
-	if v := strings.TrimSpace(os.Getenv("CANVAS_TOKEN")); v != "" {
-		cfg.Canvas.Token = v
-	}
 	if v := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")); v != "" {
 		cfg.Notifier.Telegram.BotToken = v
 		cfg.Notifier.Provider = "telegram"
@@ -484,22 +482,6 @@ func applyEnvOverrides(cfg *config) {
 	}
 	if v := strings.TrimSpace(os.Getenv("DATABASE_URL")); v != "" {
 		cfg.Database.URL = v
-	}
-	if v := strings.TrimSpace(os.Getenv("MONITOR_COURSES")); v != "" {
-		parts := strings.Split(v, ",")
-		var ids []int
-		for _, p := range parts {
-			idStr := strings.TrimSpace(p)
-			if idStr == "" {
-				continue
-			}
-			id, err := strconv.Atoi(idStr)
-			if err != nil {
-				exitErr(fmt.Errorf("invalid MONITOR_COURSES value %q: %w", idStr, err))
-			}
-			ids = append(ids, id)
-		}
-		cfg.Monitor.Courses = ids
 	}
 }
 
@@ -597,6 +579,17 @@ Commands:
   once
   run
   config`)
+}
+
+func hasCanvasConfig(cfg config) bool {
+	return strings.TrimSpace(cfg.Canvas.URL) != "" && strings.TrimSpace(cfg.Canvas.Token) != ""
+}
+
+func requireCanvasConfig(cfg config, cmd string) {
+	if hasCanvasConfig(cfg) {
+		return
+	}
+	exitErr(fmt.Errorf("%s requires canvas.url and canvas.token in config", cmd))
 }
 
 func exitErr(err error) {
