@@ -26,7 +26,18 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) EnsureSchema(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin schema tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Avoid concurrent CREATE TABLE races during rolling deploy/startup.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(781234567890123)`); err != nil {
+		return fmt.Errorf("acquire schema lock: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS telegram_bindings (
   canvas_api_key TEXT PRIMARY KEY,
   chat_id TEXT NOT NULL,
@@ -35,6 +46,21 @@ CREATE TABLE IF NOT EXISTS telegram_bindings (
 )`)
 	if err != nil {
 		return fmt.Errorf("ensure schema: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS telegram_chat_settings (
+  chat_id TEXT PRIMARY KEY,
+  lang TEXT NOT NULL DEFAULT 'ko',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)`)
+	if err != nil {
+		return fmt.Errorf("ensure chat settings schema: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit schema tx: %w", err)
 	}
 	return nil
 }
@@ -68,4 +94,39 @@ WHERE canvas_api_key = $1
 		return "", fmt.Errorf("lookup chat id: %w", err)
 	}
 	return chatID, nil
+}
+
+func (s *Store) SetChatLanguage(ctx context.Context, chatID, lang string) error {
+	if lang != "ko" && lang != "en" {
+		return fmt.Errorf("unsupported language: %s", lang)
+	}
+
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO telegram_chat_settings (chat_id, lang)
+VALUES ($1, $2)
+ON CONFLICT (chat_id)
+DO UPDATE SET
+  lang = EXCLUDED.lang,
+  updated_at = NOW()
+`, chatID, lang)
+	if err != nil {
+		return fmt.Errorf("set chat language: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetChatLanguage(ctx context.Context, chatID string) (string, error) {
+	var lang string
+	err := s.db.QueryRowContext(ctx, `
+SELECT lang
+FROM telegram_chat_settings
+WHERE chat_id = $1
+`, chatID).Scan(&lang)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get chat language: %w", err)
+	}
+	return lang, nil
 }

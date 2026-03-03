@@ -95,7 +95,9 @@ lx-agent serve
 ### Telegram Bot Commands
 
 - `/status`
+- `/settings` (default language is Korean; switch to English)
 - `/courses [keyword]`
+- `/assignments` (show course selector UI)
 - `/assignments <course_id> [limit]`
 - `/upcoming [days] [limit]`
 - `/announcements [limit]`
