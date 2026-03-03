@@ -33,6 +33,39 @@ function cleanupFlows(): void {
   }
 }
 
+function extractOAuthParam(raw: string, key: "code" | "state" | "error" | "error_description"): string | undefined {
+  const text = raw.trim();
+  if (!text) return undefined;
+
+  try {
+    const parsed = new URL(text);
+    const fromQuery = parsed.searchParams.get(key);
+    if (fromQuery) return fromQuery;
+
+    const hash = parsed.hash.startsWith("#") ? parsed.hash.slice(1) : parsed.hash;
+    const fromHash = new URLSearchParams(hash).get(key);
+    if (fromHash) return fromHash;
+  } catch {
+    // Continue with non-URL parsing below.
+  }
+
+  const stripped = text.replace(/^[?#]/, "");
+  const fromParams = new URLSearchParams(stripped).get(key);
+  if (fromParams) return fromParams;
+
+  const re = new RegExp(`[?#&]${key}=([^&#\\s]+)`);
+  const m = text.match(re);
+  if (m?.[1]) {
+    try {
+      return decodeURIComponent(m[1]);
+    } catch {
+      return m[1];
+    }
+  }
+
+  return undefined;
+}
+
 export async function startCodexOAuthFlow(): Promise<{ url: string; state: string }> {
   cleanupFlows();
   const { verifier, challenge } = await generatePKCE();
@@ -46,6 +79,8 @@ export async function startCodexOAuthFlow(): Promise<{ url: string; state: strin
   url.searchParams.set("code_challenge", challenge);
   url.searchParams.set("code_challenge_method", "S256");
   url.searchParams.set("state", state);
+  url.searchParams.set("prompt", "login");
+  url.searchParams.set("max_age", "0");
   url.searchParams.set("id_token_add_organizations", "true");
   url.searchParams.set("codex_cli_simplified_flow", "true");
   url.searchParams.set("originator", "pi");
@@ -65,26 +100,30 @@ export type ExchangeOutput = {
   refresh_token: string;
   id_token?: string;
   expires_at?: number;
+  scope?: string;
 };
 
 export async function exchangeCodexCode(input: ExchangeInput): Promise<ExchangeOutput> {
+  cleanupFlows();
   let code = input.code;
   let state = input.state;
+  let oauthError = "";
+  let oauthErrorDescription = "";
 
   if (input.redirectUrl) {
-    try {
-      const parsed = new URL(input.redirectUrl);
-      code = parsed.searchParams.get("code") ?? code;
-      state = parsed.searchParams.get("state") ?? state;
-    } catch {
-      const params = new URLSearchParams(input.redirectUrl);
-      code = params.get("code") ?? code;
-      state = params.get("state") ?? state;
-    }
+    code = extractOAuthParam(input.redirectUrl, "code") ?? code;
+    state = extractOAuthParam(input.redirectUrl, "state") ?? state;
+    oauthError = extractOAuthParam(input.redirectUrl, "error") ?? "";
+    oauthErrorDescription = extractOAuthParam(input.redirectUrl, "error_description") ?? "";
+  }
+
+  if (oauthError) {
+    const detail = oauthErrorDescription ? `: ${oauthErrorDescription}` : "";
+    throw new Error(`OAuth callback error (${oauthError})${detail}`);
   }
 
   if (!code || !state) {
-    throw new Error("Missing authorization code or state. Paste full redirect URL.");
+    throw new Error("Missing authorization code or state. Paste the full redirect URL.");
   }
 
   const entry = pendingFlows.get(state);
@@ -115,6 +154,7 @@ export async function exchangeCodexCode(input: ExchangeInput): Promise<ExchangeO
     refresh_token?: string;
     id_token?: string;
     expires_in?: number;
+    scope?: string;
   };
 
   if (!tokenJson.access_token || !tokenJson.refresh_token) {
@@ -126,5 +166,6 @@ export async function exchangeCodexCode(input: ExchangeInput): Promise<ExchangeO
     refresh_token: tokenJson.refresh_token,
     id_token: tokenJson.id_token,
     expires_at: tokenJson.expires_in ? Date.now() + tokenJson.expires_in * 1000 : undefined,
+    scope: typeof tokenJson.scope === "string" ? tokenJson.scope : undefined,
   };
 }

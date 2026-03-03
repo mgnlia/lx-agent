@@ -61,6 +61,7 @@ go run ./cmd/lx-agent serve
 
 ## Telegram Commands
 
+- `/menu` (quick action menu)
 - `/status`
 - `/settings` (change language: Korean/English)
 - `/listening` (show subscribed courses for this chat)
@@ -105,6 +106,9 @@ bun run admin:frontend
 - `DATABASE_URL`
 - `ADMIN_BACKEND_PORT` (optional; default `8787`)
 - `ADMIN_BACKEND_URL` (optional; used by lx-agent bot to call admin Codex chat API)
+- `ADMIN_BACKEND_BOT_TOKEN` (recommended with dashboard password; set same value in both `lx-agent` and `admin-dashboard` services)
+- `ADMIN_DASHBOARD_PASSWORD` (optional; when set, enables password gateway for admin dashboard/API)
+- `ADMIN_DASHBOARD_SESSION_SECONDS` (optional; session max age in seconds, default `1209600`)
 
 ## Architecture
 

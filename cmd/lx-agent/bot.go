@@ -34,8 +34,9 @@ type telegramBotUpdate struct {
 }
 
 type telegramBotMessage struct {
-	Text string `json:"text"`
-	Chat struct {
+	MessageID int    `json:"message_id"`
+	Text      string `json:"text"`
+	Chat      struct {
 		ID int64 `json:"id"`
 	} `json:"chat"`
 }
@@ -56,9 +57,16 @@ type telegramInlineMarkup struct {
 	InlineKeyboard [][]telegramInlineButton `json:"inline_keyboard"`
 }
 
+type telegramBotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
 type botResponse struct {
-	Text     string
-	Keyboard *telegramInlineMarkup
+	Text           string
+	Keyboard       *telegramInlineMarkup
+	CallbackNotice string
+	EditMessage    bool
 }
 
 type upcomingAssignment struct {
@@ -159,6 +167,13 @@ func runBotLoop(ctx context.Context, cfg config, logger *slog.Logger) error {
 	}
 
 	logger.Info("telegram command bot started", "chat_id", allowedChatID)
+	{
+		setupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		if err := syncTelegramCommands(setupCtx, botToken); err != nil {
+			logger.Warn("setMyCommands failed", "err", err)
+		}
+	}
 
 	var offset int64
 	for {
@@ -194,11 +209,23 @@ func runBotLoop(ctx context.Context, cfg config, logger *slog.Logger) error {
 				lang := languageForChat(ctx, cfg, chatID)
 				resp := handleTelegramCallback(ctx, cfg, chatID, u.CallbackQuery.Data, lang, logger)
 				if strings.TrimSpace(resp.Text) != "" {
-					if err := sendTelegramBotMessage(ctx, botToken, chatID, resp.Text, resp.Keyboard); err != nil {
-						logger.Error("telegram callback reply failed", "err", err)
+					if resp.EditMessage && u.CallbackQuery.Message != nil && u.CallbackQuery.Message.MessageID > 0 {
+						if err := editTelegramBotMessage(ctx, botToken, chatID, u.CallbackQuery.Message.MessageID, resp.Text, resp.Keyboard); err != nil {
+							logger.Warn("telegram callback edit failed; falling back to send", "err", err)
+							if sendErr := sendTelegramBotMessage(ctx, botToken, chatID, resp.Text, resp.Keyboard); sendErr != nil {
+								logger.Error("telegram callback reply failed", "err", sendErr)
+							}
+						}
+					} else {
+						if err := sendTelegramBotMessage(ctx, botToken, chatID, resp.Text, resp.Keyboard); err != nil {
+							logger.Error("telegram callback reply failed", "err", err)
+						}
 					}
 				}
-				_ = answerTelegramCallbackQuery(ctx, botToken, u.CallbackQuery.ID, "")
+				notice := trimCallbackNotice(resp.CallbackNotice)
+				if err := answerTelegramCallbackQuery(ctx, botToken, u.CallbackQuery.ID, notice); err != nil {
+					logger.Warn("answerCallbackQuery failed", "err", err)
+				}
 				continue
 			}
 
@@ -213,7 +240,7 @@ func runBotLoop(ctx context.Context, cfg config, logger *slog.Logger) error {
 
 			chatID := strconv.FormatInt(u.Message.Chat.ID, 10)
 			if allowedChatID != "" && chatID != allowedChatID {
-				_ = sendTelegramBotMessage(ctx, botToken, chatID, "This bot is bound to a different chat.", nil)
+				_ = sendTelegramBotMessage(ctx, botToken, chatID, "This bot is bound to a different chat. / 이 봇은 다른 채팅에 바인딩되어 있습니다.", nil)
 				continue
 			}
 
@@ -251,29 +278,23 @@ func handleTelegramCommand(ctx context.Context, cfg config, chatID, text, lang s
 	}
 
 	switch cmd {
-	case "/start", "/help":
-		return botResponse{Text: botHelpMessage(lang)}
+	case "/start":
+		return botResponse{
+			Text: strings.Join([]string{
+				msg(lang, "안녕하세요. 아래 빠른 메뉴에서 시작하세요.", "Welcome. Start from the quick menu below."),
+				"",
+				botHelpMessage(lang),
+			}, "\n"),
+			Keyboard: mainMenuKeyboard(lang),
+		}
+	case "/help":
+		return botResponse{Text: botHelpMessage(lang), Keyboard: mainMenuKeyboard(lang)}
+	case "/menu":
+		return botResponse{Text: botMenuMessage(lang), Keyboard: mainMenuKeyboard(lang)}
 	case "/settings":
 		return botResponse{Text: msg(lang, "언어를 선택하세요.", "Choose your language."), Keyboard: languageSettingsKeyboard(lang)}
 	case "/status":
-		filter := "all"
-		if len(cfg.Monitor.Courses) > 0 {
-			filter = strings.Trim(strings.Replace(fmt.Sprint(cfg.Monitor.Courses), " ", ",", -1), "[]")
-		}
-		subscriptions := "all"
-		if strings.TrimSpace(cfg.Database.URL) != "" {
-			if ids, err := listChatCourseIDs(ctx, cfg, chatID); err == nil && len(ids) > 0 {
-				subscriptions = strings.Trim(strings.Replace(fmt.Sprint(ids), " ", ",", -1), "[]")
-			}
-		}
-		canvasReady := "false"
-		if c, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger); err == nil && c != nil {
-			canvasReady = "true"
-		}
-		if lang == "en" {
-			return botResponse{Text: fmt.Sprintf("chat_id=%s\ncanvas_ready=%s\nmonitor_courses=%s\nsubscribed_courses=%s\npoll_interval=%s\nlang=%s", chatID, canvasReady, filter, subscriptions, cfg.Monitor.PollInterval, lang)}
-		}
-		return botResponse{Text: fmt.Sprintf("chat_id=%s\ncanvas_ready=%s\nmonitor_courses=%s\nsubscribed_courses=%s\npoll_interval=%s\n언어=%s", chatID, canvasReady, filter, subscriptions, cfg.Monitor.PollInterval, lang)}
+		return botResponse{Text: botStatusMessage(ctx, cfg, chatID, lang, logger), Keyboard: mainMenuKeyboard(lang)}
 	case "/bind":
 		if strings.TrimSpace(cfg.Database.URL) == "" {
 			return botResponse{Text: msg(lang, "바인딩에는 DATABASE_URL이 필요합니다.", "Binding requires DATABASE_URL.")}
@@ -311,7 +332,7 @@ func handleTelegramCommand(ctx context.Context, cfg config, chatID, text, lang s
 		if clientForChat == nil {
 			return canvasNotConfiguredResponse(lang)
 		}
-		resp, err := cmdListenSelector(ctx, cfg, clientForChat, lang)
+		resp, err := cmdListenSelector(ctx, cfg, clientForChat, 0, lang)
 		if err != nil {
 			return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
 		}
@@ -324,7 +345,7 @@ func handleTelegramCommand(ctx context.Context, cfg config, chatID, text, lang s
 		if clientForChat == nil {
 			return canvasNotConfiguredResponse(lang)
 		}
-		resp, err := cmdUnlistenSelector(ctx, cfg, clientForChat, chatID, lang)
+		resp, err := cmdUnlistenSelector(ctx, cfg, clientForChat, chatID, 0, lang)
 		if err != nil {
 			return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
 		}
@@ -351,7 +372,7 @@ func handleTelegramCommand(ctx context.Context, cfg config, chatID, text, lang s
 				return botResponse{Text: msg(lang, "course_id 직접 입력은 더 이상 필요하지 않습니다. /assignments 를 눌러 강의를 선택하세요.", "Typing course_id is no longer needed. Use /assignments and pick a course.")}
 			}
 		}
-		resp, err := cmdAssignmentsSelector(ctx, cfg, clientForChat, chatID, 10, lang)
+		resp, err := cmdAssignmentsSelector(ctx, cfg, clientForChat, chatID, 10, 0, lang)
 		if err != nil {
 			return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
 		}
@@ -387,7 +408,7 @@ func handleTelegramCommand(ctx context.Context, cfg config, chatID, text, lang s
 				return botResponse{Text: msg(lang, "course_id 직접 입력은 더 이상 필요하지 않습니다. /files 를 눌러 강의를 선택하세요.", "Typing course_id is no longer needed. Use /files and pick a course.")}
 			}
 		}
-		resp, err := cmdFilesSelector(ctx, cfg, clientForChat, chatID, 10, lang)
+		resp, err := cmdFilesSelector(ctx, cfg, clientForChat, chatID, 10, 0, lang)
 		if err != nil {
 			return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
 		}
@@ -402,7 +423,10 @@ func handleTelegramCommand(ctx context.Context, cfg config, chatID, text, lang s
 		}
 		return botResponse{Text: reply}
 	default:
-		return botResponse{Text: msg(lang, "알 수 없는 명령어입니다. /help 를 사용하세요.", "Unknown command. Use /help.")}
+		return botResponse{
+			Text:     msg(lang, "알 수 없는 명령어입니다. /help 또는 /menu 를 사용하세요.", "Unknown command. Use /help or /menu."),
+			Keyboard: mainMenuKeyboard(lang),
+		}
 	}
 }
 
@@ -416,9 +440,136 @@ func handleTelegramCallback(ctx context.Context, cfg config, chatID, data, lang 
 			return botResponse{Text: msg(lang, "언어 저장 실패: ", "Failed to save language: ") + err.Error()}
 		}
 		if target == "en" {
-			return botResponse{Text: "Language set to English."}
+			return botResponse{Text: "Language set to English.", Keyboard: mainMenuKeyboard("en"), CallbackNotice: "Done", EditMessage: true}
 		}
-		return botResponse{Text: "언어가 한국어로 설정되었습니다."}
+		return botResponse{Text: "언어가 한국어로 설정되었습니다.", Keyboard: mainMenuKeyboard("ko"), CallbackNotice: "완료", EditMessage: true}
+	}
+
+	if strings.HasPrefix(data, "menu:") {
+		action := strings.TrimSpace(strings.TrimPrefix(data, "menu:"))
+		switch {
+		case action == "home":
+			return botResponse{Text: botMenuMessage(lang), Keyboard: mainMenuKeyboard(lang), CallbackNotice: msg(lang, "메뉴", "Menu"), EditMessage: true}
+		case action == "settings":
+			return botResponse{Text: msg(lang, "언어를 선택하세요.", "Choose your language."), Keyboard: languageSettingsKeyboard(lang), EditMessage: true}
+		case action == "status":
+			return botResponse{Text: botStatusMessage(ctx, cfg, chatID, lang, logger), Keyboard: mainMenuKeyboard(lang), EditMessage: true}
+		case action == "listening":
+			clientForChat, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			return botResponse{Text: cmdListening(ctx, cfg, clientForChat, chatID, lang), Keyboard: mainMenuKeyboard(lang), EditMessage: true}
+		case action == "upcoming":
+			clientForChat, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			if clientForChat == nil {
+				resp := canvasNotConfiguredResponse(lang)
+				resp.EditMessage = true
+				return resp
+			}
+			return botResponse{Text: cmdUpcoming(ctx, cfg, clientForChat, chatID, nil, lang), Keyboard: mainMenuKeyboard(lang), EditMessage: true}
+		case action == "ann":
+			clientForChat, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			if clientForChat == nil {
+				resp := canvasNotConfiguredResponse(lang)
+				resp.EditMessage = true
+				return resp
+			}
+			return botResponse{Text: cmdAnnouncements(ctx, cfg, clientForChat, chatID, nil, lang), Keyboard: mainMenuKeyboard(lang), EditMessage: true}
+		case action == "courses":
+			clientForChat, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			if clientForChat == nil {
+				resp := canvasNotConfiguredResponse(lang)
+				resp.EditMessage = true
+				return resp
+			}
+			return botResponse{Text: cmdCourses(ctx, cfg, clientForChat, chatID, nil, lang), Keyboard: mainMenuKeyboard(lang), EditMessage: true}
+		case strings.HasPrefix(action, "asgsel:"):
+			clientForChat, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			if clientForChat == nil {
+				resp := canvasNotConfiguredResponse(lang)
+				resp.EditMessage = true
+				return resp
+			}
+			page := parseSelectorPage(strings.TrimPrefix(action, "asgsel:"))
+			resp, err := cmdAssignmentsSelector(ctx, cfg, clientForChat, chatID, 10, page, lang)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			resp.CallbackNotice = msg(lang, "강의 선택", "Pick a course")
+			resp.EditMessage = true
+			return resp
+		case strings.HasPrefix(action, "filsel:"):
+			clientForChat, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			if clientForChat == nil {
+				resp := canvasNotConfiguredResponse(lang)
+				resp.EditMessage = true
+				return resp
+			}
+			page := parseSelectorPage(strings.TrimPrefix(action, "filsel:"))
+			resp, err := cmdFilesSelector(ctx, cfg, clientForChat, chatID, 10, page, lang)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			resp.CallbackNotice = msg(lang, "강의 선택", "Pick a course")
+			resp.EditMessage = true
+			return resp
+		case strings.HasPrefix(action, "subsel:"):
+			clientForChat, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			if clientForChat == nil {
+				resp := canvasNotConfiguredResponse(lang)
+				resp.EditMessage = true
+				return resp
+			}
+			page := parseSelectorPage(strings.TrimPrefix(action, "subsel:"))
+			resp, err := cmdListenSelector(ctx, cfg, clientForChat, page, lang)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			resp.CallbackNotice = msg(lang, "강의 선택", "Pick a course")
+			resp.EditMessage = true
+			return resp
+		case strings.HasPrefix(action, "unsubsel:"):
+			clientForChat, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			if clientForChat == nil {
+				resp := canvasNotConfiguredResponse(lang)
+				resp.EditMessage = true
+				return resp
+			}
+			page := parseSelectorPage(strings.TrimPrefix(action, "unsubsel:"))
+			resp, err := cmdUnlistenSelector(ctx, cfg, clientForChat, chatID, page, lang)
+			if err != nil {
+				return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
+			}
+			resp.CallbackNotice = msg(lang, "강의 선택", "Pick a course")
+			resp.EditMessage = true
+			return resp
+		case action == "noop":
+			return botResponse{}
+		default:
+			return botResponse{Text: msg(lang, "지원하지 않는 메뉴 동작입니다.", "Unsupported menu action.")}
+		}
 	}
 
 	if strings.HasPrefix(data, "asg:") {
@@ -475,7 +626,7 @@ func handleTelegramCallback(ctx context.Context, cfg config, chatID, data, lang 
 		if err := addChatCourseSubscription(ctx, cfg, chatID, courseID); err != nil {
 			return botResponse{Text: msg(lang, "구독 저장 실패: ", "Failed to save subscription: ") + err.Error()}
 		}
-		return botResponse{Text: msg(lang, "강의 알림 구독이 저장되었습니다.", "Course subscription saved.")}
+		return botResponse{CallbackNotice: msg(lang, "구독 저장됨", "Subscribed")}
 	}
 
 	if strings.HasPrefix(data, "unsub:") {
@@ -486,13 +637,13 @@ func handleTelegramCallback(ctx context.Context, cfg config, chatID, data, lang 
 		if err := removeChatCourseSubscription(ctx, cfg, chatID, courseID); err != nil {
 			return botResponse{Text: msg(lang, "구독 해제 실패: ", "Failed to remove subscription: ") + err.Error()}
 		}
-		return botResponse{Text: msg(lang, "강의 알림 구독을 해제했습니다.", "Course subscription removed.")}
+		return botResponse{CallbackNotice: msg(lang, "구독 해제됨", "Unsubscribed")}
 	}
 
 	return botResponse{Text: msg(lang, "지원하지 않는 동작입니다.", "Unsupported action.")}
 }
 
-func cmdAssignmentsSelector(ctx context.Context, cfg config, client *canvas.Client, chatID string, limit int, lang string) (botResponse, error) {
+func cmdAssignmentsSelector(ctx context.Context, cfg config, client *canvas.Client, chatID string, limit int, page int, lang string) (botResponse, error) {
 	courses, err := monitoredCourses(ctx, cfg, client, chatID)
 	if err != nil {
 		return botResponse{}, err
@@ -501,8 +652,9 @@ func cmdAssignmentsSelector(ctx context.Context, cfg config, client *canvas.Clie
 		return botResponse{Text: msg(lang, "강의가 없습니다.", "No courses found.")}, nil
 	}
 
+	pageItems, page, totalPages := paginateCourses(courses, page, 8)
 	kb := &telegramInlineMarkup{}
-	for _, c := range courses {
+	for _, c := range pageItems {
 		label := c.Name
 		if len([]rune(label)) > 48 {
 			label = string([]rune(label)[:48]) + "..."
@@ -512,11 +664,13 @@ func cmdAssignmentsSelector(ctx context.Context, cfg config, client *canvas.Clie
 			CallbackData: fmt.Sprintf("asg:%d:%d", c.ID, limit),
 		}})
 	}
+	appendPaginationRow(kb, lang, page, totalPages, "asgsel")
+	appendMenuRow(kb, lang)
 
-	return botResponse{Text: msg(lang, "과제를 볼 강의를 선택하세요.", "Select a course to view assignments."), Keyboard: kb}, nil
+	return botResponse{Text: selectorPrompt(lang, msg(lang, "과제를 볼 강의를 선택하세요.", "Select a course to view assignments."), page, totalPages), Keyboard: kb}, nil
 }
 
-func cmdFilesSelector(ctx context.Context, cfg config, client *canvas.Client, chatID string, limit int, lang string) (botResponse, error) {
+func cmdFilesSelector(ctx context.Context, cfg config, client *canvas.Client, chatID string, limit int, page int, lang string) (botResponse, error) {
 	courses, err := monitoredCourses(ctx, cfg, client, chatID)
 	if err != nil {
 		return botResponse{}, err
@@ -525,8 +679,9 @@ func cmdFilesSelector(ctx context.Context, cfg config, client *canvas.Client, ch
 		return botResponse{Text: msg(lang, "강의가 없습니다.", "No courses found.")}, nil
 	}
 
+	pageItems, page, totalPages := paginateCourses(courses, page, 8)
 	kb := &telegramInlineMarkup{}
-	for _, c := range courses {
+	for _, c := range pageItems {
 		label := c.Name
 		if len([]rune(label)) > 48 {
 			label = string([]rune(label)[:48]) + "..."
@@ -536,8 +691,10 @@ func cmdFilesSelector(ctx context.Context, cfg config, client *canvas.Client, ch
 			CallbackData: fmt.Sprintf("fil:%d:%d", c.ID, limit),
 		}})
 	}
+	appendPaginationRow(kb, lang, page, totalPages, "filsel")
+	appendMenuRow(kb, lang)
 
-	return botResponse{Text: msg(lang, "파일을 볼 강의를 선택하세요.", "Select a course to view files."), Keyboard: kb}, nil
+	return botResponse{Text: selectorPrompt(lang, msg(lang, "파일을 볼 강의를 선택하세요.", "Select a course to view files."), page, totalPages), Keyboard: kb}, nil
 }
 
 func cmdCourses(ctx context.Context, cfg config, client *canvas.Client, chatID string, args []string, lang string) string {
@@ -909,13 +1066,61 @@ func filterCoursesBySemester(courses []canvas.Course, semesterKey string) []canv
 	return out
 }
 
-func defaultSemesterCourses(courses []canvas.Course) ([]canvas.Course, string) {
-	semesterKey := currentSemesterKeyKST(time.Now())
+func dominantEnrollmentTermID(courses []canvas.Course) (int, bool) {
+	counts := make(map[int]int)
+	bestTermID := 0
+	bestCount := 0
+	for _, c := range courses {
+		if c.EnrollmentTermID <= 0 {
+			continue
+		}
+		counts[c.EnrollmentTermID]++
+		if counts[c.EnrollmentTermID] > bestCount {
+			bestCount = counts[c.EnrollmentTermID]
+			bestTermID = c.EnrollmentTermID
+		}
+	}
+	if bestTermID <= 0 {
+		return 0, false
+	}
+	return bestTermID, true
+}
+
+func filterCoursesByEnrollmentTerm(courses []canvas.Course, termID int) []canvas.Course {
+	if termID <= 0 {
+		return nil
+	}
+	var out []canvas.Course
+	for _, c := range courses {
+		if c.EnrollmentTermID == termID {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func defaultSemesterCoursesForKey(courses []canvas.Course, semesterKey string) []canvas.Course {
 	filtered := filterCoursesBySemester(courses, semesterKey)
 	if len(filtered) == 0 {
-		return courses, semesterKey
+		return courses
 	}
-	return filtered, semesterKey
+
+	// If only some courses include semester text in their name/code, expand to
+	// all courses in the same enrollment term so English-titled classes are kept.
+	termID, ok := dominantEnrollmentTermID(filtered)
+	if !ok {
+		return filtered
+	}
+	termCourses := filterCoursesByEnrollmentTerm(courses, termID)
+	if len(termCourses) == 0 {
+		return filtered
+	}
+	return termCourses
+}
+
+func defaultSemesterCourses(courses []canvas.Course) ([]canvas.Course, string) {
+	semesterKey := currentSemesterKeyKST(time.Now())
+	return defaultSemesterCoursesForKey(courses, semesterKey), semesterKey
 }
 
 func availableCourses(ctx context.Context, cfg config, client *canvas.Client) ([]canvas.Course, error) {
@@ -1007,7 +1212,7 @@ func cmdListening(ctx context.Context, cfg config, client *canvas.Client, chatID
 	return trimForTelegram(strings.Join(lines, "\n"))
 }
 
-func cmdListenSelector(ctx context.Context, cfg config, client *canvas.Client, lang string) (botResponse, error) {
+func cmdListenSelector(ctx context.Context, cfg config, client *canvas.Client, page int, lang string) (botResponse, error) {
 	courses, err := availableCourses(ctx, cfg, client)
 	if err != nil {
 		return botResponse{}, err
@@ -1016,8 +1221,9 @@ func cmdListenSelector(ctx context.Context, cfg config, client *canvas.Client, l
 		return botResponse{Text: msg(lang, "강의가 없습니다.", "No courses found.")}, nil
 	}
 
+	pageItems, page, totalPages := paginateCourses(courses, page, 8)
 	kb := &telegramInlineMarkup{}
-	for _, c := range courses {
+	for _, c := range pageItems {
 		label := c.Name
 		if len([]rune(label)) > 48 {
 			label = string([]rune(label)[:48]) + "..."
@@ -1027,10 +1233,12 @@ func cmdListenSelector(ctx context.Context, cfg config, client *canvas.Client, l
 			CallbackData: fmt.Sprintf("sub:%d", c.ID),
 		}})
 	}
-	return botResponse{Text: msg(lang, "알림을 받을 강의를 선택하세요.", "Select a course to subscribe for alerts."), Keyboard: kb}, nil
+	appendPaginationRow(kb, lang, page, totalPages, "subsel")
+	appendMenuRow(kb, lang)
+	return botResponse{Text: selectorPrompt(lang, msg(lang, "알림을 받을 강의를 선택하세요.", "Select a course to subscribe for alerts."), page, totalPages), Keyboard: kb}, nil
 }
 
-func cmdUnlistenSelector(ctx context.Context, cfg config, client *canvas.Client, chatID, lang string) (botResponse, error) {
+func cmdUnlistenSelector(ctx context.Context, cfg config, client *canvas.Client, chatID string, page int, lang string) (botResponse, error) {
 	ids, err := listChatCourseIDs(ctx, cfg, chatID)
 	if err != nil {
 		return botResponse{}, err
@@ -1048,8 +1256,9 @@ func cmdUnlistenSelector(ctx context.Context, cfg config, client *canvas.Client,
 		nameByID[c.ID] = c.Name
 	}
 
+	pageIDs, page, totalPages := paginateCourseIDs(ids, page, 8)
 	kb := &telegramInlineMarkup{}
-	for _, id := range ids {
+	for _, id := range pageIDs {
 		label := nameByID[id]
 		if label == "" {
 			label = fmt.Sprintf("Course %d", id)
@@ -1062,13 +1271,16 @@ func cmdUnlistenSelector(ctx context.Context, cfg config, client *canvas.Client,
 			CallbackData: fmt.Sprintf("unsub:%d", id),
 		}})
 	}
-	return botResponse{Text: msg(lang, "구독 해제할 강의를 선택하세요.", "Select a course to unsubscribe."), Keyboard: kb}, nil
+	appendPaginationRow(kb, lang, page, totalPages, "unsubsel")
+	appendMenuRow(kb, lang)
+	return botResponse{Text: selectorPrompt(lang, msg(lang, "구독 해제할 강의를 선택하세요.", "Select a course to unsubscribe."), page, totalPages), Keyboard: kb}, nil
 }
 
 func botHelpMessage(lang string) string {
 	if lang == "en" {
 		return strings.Join([]string{
 			"Available commands:",
+			"/menu",
 			"/status",
 			"/settings",
 			"/listening",
@@ -1086,6 +1298,7 @@ func botHelpMessage(lang string) string {
 	}
 	return strings.Join([]string{
 		"사용 가능한 명령어:",
+		"/menu",
 		"/status",
 		"/settings",
 		"/listening",
@@ -1108,7 +1321,156 @@ func languageSettingsKeyboard(lang string) *telegramInlineMarkup {
 			{Text: langLabel(lang, "한국어", "Korean"), CallbackData: "lang:ko"},
 			{Text: langLabel(lang, "English", "English"), CallbackData: "lang:en"},
 		},
+		{
+			{Text: msg(lang, "메뉴", "Menu"), CallbackData: "menu:home"},
+		},
 	}}
+}
+
+func botMenuMessage(lang string) string {
+	if lang == "en" {
+		return "Quick actions:"
+	}
+	return "빠른 메뉴:"
+}
+
+func mainMenuKeyboard(lang string) *telegramInlineMarkup {
+	return &telegramInlineMarkup{InlineKeyboard: [][]telegramInlineButton{
+		{
+			{Text: msg(lang, "과제", "Assignments"), CallbackData: "menu:asgsel:0"},
+			{Text: msg(lang, "파일", "Files"), CallbackData: "menu:filsel:0"},
+		},
+		{
+			{Text: msg(lang, "다가올 과제", "Upcoming"), CallbackData: "menu:upcoming"},
+			{Text: msg(lang, "공지", "Announcements"), CallbackData: "menu:ann"},
+		},
+		{
+			{Text: msg(lang, "구독 보기", "Subscriptions"), CallbackData: "menu:listening"},
+			{Text: msg(lang, "강의 목록", "Courses"), CallbackData: "menu:courses"},
+		},
+		{
+			{Text: msg(lang, "구독 추가", "Subscribe"), CallbackData: "menu:subsel:0"},
+			{Text: msg(lang, "구독 해제", "Unsubscribe"), CallbackData: "menu:unsubsel:0"},
+		},
+		{
+			{Text: msg(lang, "상태", "Status"), CallbackData: "menu:status"},
+			{Text: msg(lang, "설정", "Settings"), CallbackData: "menu:settings"},
+		},
+		{
+			{Text: msg(lang, "관리자 열기", "Open Admin"), URL: adminDashboardURL()},
+		},
+	}}
+}
+
+func appendMenuRow(kb *telegramInlineMarkup, lang string) {
+	kb.InlineKeyboard = append(kb.InlineKeyboard, []telegramInlineButton{{
+		Text:         msg(lang, "메뉴", "Menu"),
+		CallbackData: "menu:home",
+	}})
+}
+
+func appendPaginationRow(kb *telegramInlineMarkup, lang string, page, totalPages int, actionPrefix string) {
+	if totalPages <= 1 {
+		return
+	}
+	var row []telegramInlineButton
+	if page > 0 {
+		row = append(row, telegramInlineButton{
+			Text:         msg(lang, "이전", "Prev"),
+			CallbackData: fmt.Sprintf("menu:%s:%d", actionPrefix, page-1),
+		})
+	}
+	row = append(row, telegramInlineButton{
+		Text:         fmt.Sprintf("%d/%d", page+1, totalPages),
+		CallbackData: "menu:noop",
+	})
+	if page < totalPages-1 {
+		row = append(row, telegramInlineButton{
+			Text:         msg(lang, "다음", "Next"),
+			CallbackData: fmt.Sprintf("menu:%s:%d", actionPrefix, page+1),
+		})
+	}
+	kb.InlineKeyboard = append(kb.InlineKeyboard, row)
+}
+
+func selectorPrompt(lang, title string, page, totalPages int) string {
+	if totalPages <= 1 {
+		return title
+	}
+	return fmt.Sprintf("%s (%d/%d)", title, page+1, totalPages)
+}
+
+func paginateCourses(courses []canvas.Course, page, pageSize int) ([]canvas.Course, int, int) {
+	if pageSize <= 0 {
+		pageSize = 8
+	}
+	totalPages := (len(courses) + pageSize - 1) / pageSize
+	if totalPages <= 0 {
+		totalPages = 1
+	}
+	if page < 0 {
+		page = 0
+	}
+	if page >= totalPages {
+		page = totalPages - 1
+	}
+	start := page * pageSize
+	end := start + pageSize
+	if end > len(courses) {
+		end = len(courses)
+	}
+	return courses[start:end], page, totalPages
+}
+
+func paginateCourseIDs(ids []int, page, pageSize int) ([]int, int, int) {
+	if pageSize <= 0 {
+		pageSize = 8
+	}
+	totalPages := (len(ids) + pageSize - 1) / pageSize
+	if totalPages <= 0 {
+		totalPages = 1
+	}
+	if page < 0 {
+		page = 0
+	}
+	if page >= totalPages {
+		page = totalPages - 1
+	}
+	start := page * pageSize
+	end := start + pageSize
+	if end > len(ids) {
+		end = len(ids)
+	}
+	return ids[start:end], page, totalPages
+}
+
+func parseSelectorPage(raw string) int {
+	page, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || page < 0 {
+		return 0
+	}
+	return page
+}
+
+func botStatusMessage(ctx context.Context, cfg config, chatID, lang string, logger *slog.Logger) string {
+	filter := "all"
+	if len(cfg.Monitor.Courses) > 0 {
+		filter = strings.Trim(strings.Replace(fmt.Sprint(cfg.Monitor.Courses), " ", ",", -1), "[]")
+	}
+	subscriptions := "all"
+	if strings.TrimSpace(cfg.Database.URL) != "" {
+		if ids, err := listChatCourseIDs(ctx, cfg, chatID); err == nil && len(ids) > 0 {
+			subscriptions = strings.Trim(strings.Replace(fmt.Sprint(ids), " ", ",", -1), "[]")
+		}
+	}
+	canvasReady := "false"
+	if c, err := resolveCanvasClientForChat(ctx, cfg, chatID, logger); err == nil && c != nil {
+		canvasReady = "true"
+	}
+	if lang == "en" {
+		return fmt.Sprintf("chat_id=%s\ncanvas_ready=%s\nmonitor_courses=%s\nsubscribed_courses=%s\npoll_interval=%s\nlang=%s", chatID, canvasReady, filter, subscriptions, cfg.Monitor.PollInterval, lang)
+	}
+	return fmt.Sprintf("chat_id=%s\ncanvas_ready=%s\nmonitor_courses=%s\nsubscribed_courses=%s\npoll_interval=%s\n언어=%s", chatID, canvasReady, filter, subscriptions, cfg.Monitor.PollInterval, lang)
 }
 
 func langLabel(lang, ko, en string) string {
@@ -1139,6 +1501,10 @@ func adminBackendURL() string {
 	return strings.TrimRight(adminDashboardURL(), "/")
 }
 
+func adminBackendBotToken() string {
+	return strings.TrimSpace(os.Getenv("ADMIN_BACKEND_BOT_TOKEN"))
+}
+
 func requestCodexReply(ctx context.Context, chatID, message, lang string) (string, error) {
 	payload := map[string]string{
 		"chatId":  chatID,
@@ -1152,6 +1518,9 @@ func requestCodexReply(ctx context.Context, chatID, message, lang string) (strin
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if token := adminBackendBotToken(); token != "" {
+		req.Header.Set("X-Admin-Bot-Token", token)
+	}
 
 	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
 	if err != nil {
@@ -1300,6 +1669,120 @@ func sendTelegramBotMessage(ctx context.Context, botToken, chatID, message strin
 	return nil
 }
 
+func editTelegramBotMessage(ctx context.Context, botToken, chatID string, messageID int, message string, keyboard *telegramInlineMarkup) error {
+	u := fmt.Sprintf("https://api.telegram.org/bot%s/editMessageText", botToken)
+	vals := url.Values{}
+	vals.Set("chat_id", chatID)
+	vals.Set("message_id", strconv.Itoa(messageID))
+	vals.Set("text", trimForTelegram(message))
+	vals.Set("disable_web_page_preview", "true")
+	if keyboard != nil {
+		b, _ := json.Marshal(keyboard)
+		vals.Set("reply_markup", string(b))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(vals.Encode()))
+	if err != nil {
+		return fmt.Errorf("telegram edit request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram edit: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("telegram edit error: %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func syncTelegramCommands(ctx context.Context, botToken string) error {
+	commandsEn := []telegramBotCommand{
+		{Command: "menu", Description: "Open quick actions"},
+		{Command: "status", Description: "Show bot status"},
+		{Command: "settings", Description: "Language settings"},
+		{Command: "listening", Description: "Show subscriptions"},
+		{Command: "listen", Description: "Subscribe to a course"},
+		{Command: "unlisten", Description: "Unsubscribe from a course"},
+		{Command: "courses", Description: "Show course list"},
+		{Command: "assignments", Description: "Pick course assignments"},
+		{Command: "upcoming", Description: "Upcoming due assignments"},
+		{Command: "announcements", Description: "Recent announcements"},
+		{Command: "files", Description: "Pick course files"},
+		{Command: "chat", Description: "Ask Codex"},
+		{Command: "bind", Description: "Bind Canvas token"},
+		{Command: "help", Description: "Show help"},
+	}
+	commandsKo := []telegramBotCommand{
+		{Command: "menu", Description: "빠른 메뉴 열기"},
+		{Command: "status", Description: "상태 보기"},
+		{Command: "settings", Description: "언어 설정"},
+		{Command: "listening", Description: "구독 목록"},
+		{Command: "listen", Description: "강의 구독"},
+		{Command: "unlisten", Description: "강의 구독 해제"},
+		{Command: "courses", Description: "강의 목록"},
+		{Command: "assignments", Description: "강의 과제 선택"},
+		{Command: "upcoming", Description: "다가올 과제"},
+		{Command: "announcements", Description: "최근 공지"},
+		{Command: "files", Description: "강의 파일 선택"},
+		{Command: "chat", Description: "Codex에게 질문"},
+		{Command: "bind", Description: "Canvas 토큰 바인딩"},
+		{Command: "help", Description: "도움말"},
+	}
+	if err := setTelegramCommands(ctx, botToken, "", commandsEn); err != nil {
+		return err
+	}
+	if err := setTelegramCommands(ctx, botToken, "ko", commandsKo); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setTelegramCommands(ctx context.Context, botToken, languageCode string, commands []telegramBotCommand) error {
+	u := fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", botToken)
+	payload := map[string]any{
+		"commands": commands,
+	}
+	if languageCode != "" {
+		payload["language_code"] = languageCode
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("setMyCommands request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("setMyCommands send: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("setMyCommands error %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var parsed struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return fmt.Errorf("setMyCommands decode: %w", err)
+	}
+	if !parsed.OK {
+		if strings.TrimSpace(parsed.Description) == "" {
+			return errors.New("setMyCommands returned ok=false")
+		}
+		return errors.New(parsed.Description)
+	}
+	return nil
+}
+
 func answerTelegramCallbackQuery(ctx context.Context, botToken, callbackQueryID, text string) error {
 	u := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", botToken)
 	params := url.Values{"callback_query_id": {callbackQueryID}}
@@ -1324,6 +1807,15 @@ func answerTelegramCallbackQuery(ctx context.Context, botToken, callbackQueryID,
 		return fmt.Errorf("answerCallbackQuery error: %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
+}
+
+func trimCallbackNotice(message string) string {
+	const maxChars = 180
+	r := []rune(strings.TrimSpace(message))
+	if len(r) <= maxChars {
+		return string(r)
+	}
+	return string(r[:maxChars])
 }
 
 func trimForTelegram(message string) string {

@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 export type AdminConfig = {
@@ -16,6 +16,7 @@ export type CodexAccount = {
   refresh_token: string;
   id_token?: string;
   expires_at?: number;
+  scope?: string;
 };
 
 const configPath = resolve(process.cwd(), "apps/admin-backend/data/config.json");
@@ -77,6 +78,7 @@ export async function loadCodexAccount(): Promise<CodexAccount | null> {
       refresh_token: parsed.refresh_token,
       id_token: parsed.id_token,
       expires_at: parsed.expires_at,
+      scope: typeof parsed.scope === "string" ? parsed.scope : undefined,
     };
   } catch {
     return null;
@@ -90,6 +92,10 @@ export async function hasCodexAccount(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function clearCodexAccount(): Promise<void> {
+  await rm(codexPath, { force: true });
 }
 
 export function getCodexAccountPath(): string {

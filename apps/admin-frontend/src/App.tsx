@@ -20,11 +20,41 @@ type ChatRow = {
 
 const apiBase = import.meta.env.VITE_ADMIN_BACKEND_URL || window.location.origin;
 
+function extractOAuthParam(raw: string, key: "code" | "state"): string {
+  const text = raw.trim();
+  if (!text) return "";
+
+  try {
+    const parsed = new URL(text);
+    const fromQuery = parsed.searchParams.get(key);
+    if (fromQuery) return fromQuery;
+    const hash = parsed.hash.startsWith("#") ? parsed.hash.slice(1) : parsed.hash;
+    const fromHash = new URLSearchParams(hash).get(key);
+    if (fromHash) return fromHash;
+  } catch {
+    // Continue with fallback parsing.
+  }
+
+  const stripped = text.replace(/^[?#]/, "");
+  const fromParams = new URLSearchParams(stripped).get(key);
+  if (fromParams) return fromParams;
+
+  const re = new RegExp(`[?#&]${key}=([^&#\\s]+)`);
+  const m = text.match(re);
+  if (!m?.[1]) return "";
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return m[1];
+  }
+}
+
 export function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [linked, setLinked] = useState(false);
   const [chats, setChats] = useState<ChatRow[]>([]);
   const [oauthUrl, setOauthUrl] = useState("");
+  const [oauthState, setOauthState] = useState("");
   const [redirectUrl, setRedirectUrl] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
@@ -62,9 +92,10 @@ export function App() {
     setMessage("");
     try {
       const res = await fetch(`${apiBase}/api/providers/openai-codex/oauth/start`, { method: "POST" });
-      const data = (await res.json()) as { ok: boolean; url?: string; error?: string };
+      const data = (await res.json()) as { ok: boolean; url?: string; state?: string; error?: string };
       if (!data.ok || !data.url) throw new Error(data.error || "Failed to start OAuth");
       setOauthUrl(data.url);
+      setOauthState(typeof data.state === "string" ? data.state : "");
       window.open(data.url, "_blank", "noopener,noreferrer");
       setMessage("Opened ChatGPT login in a new tab. Paste the callback URL below.");
     } catch (err) {
@@ -83,15 +114,37 @@ export function App() {
     setLoading(true);
     setMessage("");
     try {
+      const code = extractOAuthParam(redirectUrl, "code");
+      const state = extractOAuthParam(redirectUrl, "state") || oauthState;
       const res = await fetch(`${apiBase}/api/providers/openai-codex/oauth/callback`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ redirectUrl }),
+        body: JSON.stringify({ redirectUrl, code, state }),
       });
       const data = (await res.json()) as { ok: boolean; error?: string };
       if (!data.ok) throw new Error(data.error || "OAuth callback failed");
       setRedirectUrl("");
+      setOauthState("");
       setMessage("ChatGPT account connected.");
+      await load();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function removeOauth() {
+    setLoading(true);
+    setMessage("");
+    try {
+      const res = await fetch(`${apiBase}/api/providers/openai-codex/oauth/remove`, { method: "POST" });
+      const data = (await res.json()) as { ok: boolean; error?: string };
+      if (!data.ok) throw new Error(data.error || "Failed to remove ChatGPT login");
+      setOauthUrl("");
+      setOauthState("");
+      setRedirectUrl("");
+      setMessage("ChatGPT login removed.");
       await load();
     } catch (err) {
       setMessage(err instanceof Error ? err.message : String(err));
@@ -133,9 +186,14 @@ export function App() {
       <section style={card}>
         <h2 style={h2}>ChatGPT Login</h2>
         <p>Status: {linked ? "Connected" : "Not connected"}</p>
-        <button onClick={startOauth} disabled={loading} style={btn}>
-          Login with ChatGPT
-        </button>
+        <div style={actions}>
+          <button onClick={startOauth} disabled={loading} style={btn}>
+            Login with ChatGPT
+          </button>
+          <button onClick={removeOauth} disabled={loading || !linked} style={btnDanger}>
+            Remove Login
+          </button>
+        </div>
 
         {oauthUrl ? (
           <p style={{ fontSize: 12, wordBreak: "break-all", color: "#666" }}>
@@ -243,6 +301,17 @@ const btnAlt: React.CSSProperties = {
   ...btn,
   background: "#333",
   marginTop: "0.5rem",
+};
+
+const btnDanger: React.CSSProperties = {
+  ...btn,
+  background: "#9f1239",
+};
+
+const actions: React.CSSProperties = {
+  display: "flex",
+  gap: "0.5rem",
+  flexWrap: "wrap",
 };
 
 const textarea: React.CSSProperties = {
