@@ -147,6 +147,24 @@ WHERE canvas_api_key = $1
 	return chatID, nil
 }
 
+func (s *Store) LookupCanvasAPIKeyByChatID(ctx context.Context, chatID string) (string, error) {
+	var canvasAPIKey string
+	err := s.db.QueryRowContext(ctx, `
+SELECT canvas_api_key
+FROM telegram_bindings
+WHERE chat_id = $1
+ORDER BY updated_at DESC
+LIMIT 1
+`, chatID).Scan(&canvasAPIKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("lookup canvas api key by chat id: %w", err)
+	}
+	return canvasAPIKey, nil
+}
+
 func (s *Store) SetChatLanguage(ctx context.Context, chatID, lang string) error {
 	if lang != "ko" && lang != "en" {
 		return fmt.Errorf("unsupported language: %s", lang)
