@@ -71,6 +71,8 @@ go run ./cmd/lx-agent serve
 - `/files` (interactive course selector)
 - `/upcoming [days] [limit]`
 - `/announcements [limit]`
+- `/chat <message>` (Codex conversation)
+- Plain text message (without `/`) also routes to Codex conversation
 - `/bind`
 
 ## Admin Dashboard (TypeScript + Bun)
@@ -102,6 +104,7 @@ bun run admin:frontend
 - `TELEGRAM_CHAT_ID`
 - `DATABASE_URL`
 - `ADMIN_BACKEND_PORT` (optional; default `8787`)
+- `ADMIN_BACKEND_URL` (optional; used by lx-agent bot to call admin Codex chat API)
 
 ## Architecture
 

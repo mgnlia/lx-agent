@@ -1,4 +1,4 @@
-import { hasCodexAccount, loadConfig, saveCodexAccount, saveConfig } from "./config-store";
+import { hasCodexAccount, loadCodexAccount, loadConfig, saveCodexAccount, saveConfig } from "./config-store";
 import { exchangeCodexCode, startCodexOAuthFlow } from "./oauth";
 import { stat } from "node:fs/promises";
 import { extname, resolve } from "node:path";
@@ -48,6 +48,81 @@ type ChatRow = {
   sent_alerts: number;
   last_sent_at: string | null;
 };
+
+type CodexTurn = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+const codexConversations = new Map<string, CodexTurn[]>();
+const maxConversationTurns = 12;
+
+function normalizeCodexModel(modelId: string): string {
+  const stripped = modelId.replace(/^openai-codex\//, "");
+  if (stripped === "gpt-5.3-codex-spark") return "gpt-5.3-codex";
+  return stripped || "gpt-5.3-codex";
+}
+
+function getConversation(chatId: string): CodexTurn[] {
+  return codexConversations.get(chatId) ?? [];
+}
+
+function saveConversation(chatId: string, turns: CodexTurn[]): void {
+  if (!chatId) return;
+  const clipped = turns.slice(-maxConversationTurns);
+  codexConversations.set(chatId, clipped);
+}
+
+async function chatWithCodex(input: { chatId: string; message: string; lang?: string }): Promise<string> {
+  const account = await loadCodexAccount();
+  if (!account?.access_token) {
+    throw new Error("Codex account is not linked. Login with ChatGPT in admin dashboard first.");
+  }
+
+  const config = await loadConfig();
+  const model = normalizeCodexModel(config.defaultModel);
+  const conversation = getConversation(input.chatId);
+  const systemPrompt =
+    input.lang === "en"
+      ? "You are a concise Telegram assistant for university course support."
+      : "당신은 대학 강의 지원용 텔레그램 도우미입니다. 짧고 정확하게 답하세요.";
+
+  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+    { role: "system", content: systemPrompt },
+    ...conversation,
+    { role: "user", content: input.message },
+  ];
+
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${account.access_token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: 0.2,
+    }),
+  });
+
+  const payload = (await resp.json().catch(() => ({}))) as {
+    choices?: Array<{ message?: { content?: string } }>;
+    error?: { message?: string };
+  };
+
+  if (!resp.ok) {
+    throw new Error(payload.error?.message || `Codex request failed (${resp.status})`);
+  }
+
+  const reply = String(payload.choices?.[0]?.message?.content || "").trim();
+  if (!reply) {
+    throw new Error("Codex returned an empty response.");
+  }
+
+  saveConversation(input.chatId, [...conversation, { role: "user", content: input.message }, { role: "assistant", content: reply }]);
+  return reply;
+}
 
 async function ensureChatSchema(): Promise<void> {
   if (!pool || schemaReady) return;
@@ -284,6 +359,23 @@ Bun.serve({
         return json({ ok: true }, {}, origin);
       } catch (err) {
         return json({ ok: false, error: err instanceof Error ? err.message : String(err) }, { status: 400 }, origin);
+      }
+    }
+
+    if (url.pathname === "/api/codex/chat" && req.method === "POST") {
+      try {
+        const body = await parseJson(req);
+        const message = String(body.message || "").trim();
+        const chatId = String(body.chatId || "default").trim() || "default";
+        const lang = typeof body.lang === "string" ? body.lang : undefined;
+        if (!message) {
+          return json({ ok: false, error: "message is required" }, { status: 400 }, origin);
+        }
+
+        const reply = await chatWithCodex({ chatId, message, lang });
+        return json({ ok: true, reply }, {}, origin);
+      } catch (err) {
+        return json({ ok: false, error: err instanceof Error ? err.message : String(err) }, { status: 500 }, origin);
       }
     }
 

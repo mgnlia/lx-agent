@@ -67,6 +67,22 @@ export async function saveCodexAccount(account: CodexAccount): Promise<void> {
   await writeFile(codexPath, JSON.stringify(account, null, 2), "utf8");
 }
 
+export async function loadCodexAccount(): Promise<CodexAccount | null> {
+  try {
+    const raw = await readFile(codexPath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<CodexAccount>;
+    if (!parsed.access_token || !parsed.refresh_token) return null;
+    return {
+      access_token: parsed.access_token,
+      refresh_token: parsed.refresh_token,
+      id_token: parsed.id_token,
+      expires_at: parsed.expires_at,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function hasCodexAccount(): Promise<boolean> {
   try {
     await stat(codexPath);

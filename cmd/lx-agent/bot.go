@@ -242,6 +242,14 @@ func handleTelegramCommand(ctx context.Context, cfg config, chatID, text, lang s
 	}
 	args := fields[1:]
 
+	if !strings.HasPrefix(cmd, "/") {
+		reply, err := requestCodexReply(ctx, chatID, text, lang)
+		if err != nil {
+			return botResponse{Text: msg(lang, "Codex 응답 실패: ", "Codex reply failed: ") + err.Error()}
+		}
+		return botResponse{Text: reply}
+	}
+
 	switch cmd {
 	case "/start", "/help":
 		return botResponse{Text: botHelpMessage(lang)}
@@ -384,6 +392,15 @@ func handleTelegramCommand(ctx context.Context, cfg config, chatID, text, lang s
 			return botResponse{Text: msg(lang, "오류: ", "Error: ") + err.Error()}
 		}
 		return resp
+	case "/chat":
+		if len(args) == 0 {
+			return botResponse{Text: msg(lang, "사용법: /chat <메시지>", "Usage: /chat <message>")}
+		}
+		reply, err := requestCodexReply(ctx, chatID, strings.Join(args, " "), lang)
+		if err != nil {
+			return botResponse{Text: msg(lang, "Codex 응답 실패: ", "Codex reply failed: ") + err.Error()}
+		}
+		return botResponse{Text: reply}
 	default:
 		return botResponse{Text: msg(lang, "알 수 없는 명령어입니다. /help 를 사용하세요.", "Unknown command. Use /help.")}
 	}
@@ -1050,6 +1067,8 @@ func botHelpMessage(lang string) string {
 			"/upcoming [days] [limit]",
 			"/announcements [limit]",
 			"/files (interactive course selector)",
+			"/chat <message> (Codex)",
+			"or just send plain text to chat with Codex",
 			"/bind",
 		}, "\n")
 	}
@@ -1065,6 +1084,8 @@ func botHelpMessage(lang string) string {
 		"/upcoming [days] [limit]",
 		"/announcements [limit]",
 		"/files (강의 선택기)",
+		"/chat <메시지> (Codex)",
+		"또는 일반 텍스트를 보내 Codex와 대화",
 		"/bind",
 	}, "\n")
 }
@@ -1097,6 +1118,55 @@ func adminDashboardURL() string {
 		return v
 	}
 	return "https://admin-dashboard-production-da11.up.railway.app"
+}
+
+func adminBackendURL() string {
+	if v := strings.TrimSpace(os.Getenv("ADMIN_BACKEND_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return strings.TrimRight(adminDashboardURL(), "/")
+}
+
+func requestCodexReply(ctx context.Context, chatID, message, lang string) (string, error) {
+	payload := map[string]string{
+		"chatId":  chatID,
+		"message": message,
+		"lang":    lang,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, adminBackendURL()+"/api/codex/chat", strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		OK    bool   `json:"ok"`
+		Reply string `json:"reply"`
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &parsed)
+	if resp.StatusCode >= 400 || !parsed.OK {
+		if parsed.Error != "" {
+			return "", errors.New(parsed.Error)
+		}
+		return "", fmt.Errorf("admin backend error (%d)", resp.StatusCode)
+	}
+	if strings.TrimSpace(parsed.Reply) == "" {
+		return "", errors.New("empty reply")
+	}
+	return trimForTelegram(parsed.Reply), nil
 }
 
 func canvasNotConfiguredResponse(lang string) botResponse {
