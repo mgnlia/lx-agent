@@ -2,7 +2,7 @@
 
 Canvas LMS (Learning X) monitoring agent in Go, with Telegram bot controls and a Bun + TypeScript admin dashboard for ChatGPT/Codex account linking.
 
-Built for [서울대 Learning X](https://learningx.snu.ac.kr), compatible with Canvas LMS APIs.
+Built for [서울대 Learning X](https://myetl.snu.ac.kr), compatible with Canvas LMS APIs.
 
 ## Features
 
@@ -27,7 +27,7 @@ cp config.yaml.example config.yaml
 
 ```yaml
 canvas:
-  url: "learningx.snu.ac.kr"
+  url: "myetl.snu.ac.kr"
   token: "..."
 
 notifier:

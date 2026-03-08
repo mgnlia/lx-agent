@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"bytes"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 type Client struct {
 	baseURL    string
 	token      string
+	cookies    []*http.Cookie // session cookie auth (for SNU myETL)
 	httpClient *http.Client
 	logger     *slog.Logger
 }
@@ -36,6 +38,33 @@ func NewClient(baseURL, token string, logger *slog.Logger) *Client {
 	}
 }
 
+// SetCookies sets session cookies for authentication (used when Bearer token
+// auth is unavailable, e.g. SNU myETL which requires session-based auth).
+func (c *Client) SetCookies(cookies []*http.Cookie) {
+	c.cookies = cookies
+}
+
+// addAuth adds authentication to a request. Prefers session cookies if set,
+// otherwise falls back to Bearer token.
+func (c *Client) addAuth(req *http.Request) {
+	if len(c.cookies) > 0 {
+		for _, ck := range c.cookies {
+			req.AddCookie(ck)
+		}
+	} else if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+}
+
+// stripJSONPrefix removes the "while(1);" CSRF prefix that some Canvas
+// instances (e.g. SNU myETL) prepend to JSON responses.
+func stripJSONPrefix(data []byte) []byte {
+	if bytes.HasPrefix(data, []byte("while(1);")) {
+		return data[9:]
+	}
+	return data
+}
+
 func (c *Client) do(ctx context.Context, method, path string, params url.Values) (*http.Response, error) {
 	u := c.baseURL + "/api/v1" + path
 	if len(params) > 0 {
@@ -47,7 +76,7 @@ func (c *Client) do(ctx context.Context, method, path string, params url.Values)
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	c.addAuth(req)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -67,6 +96,14 @@ func (c *Client) do(ctx context.Context, method, path string, params url.Values)
 		resp.Body.Close()
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
+
+	// Wrap body to strip "while(1);" CSRF prefix if present
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(stripJSONPrefix(body)))
 
 	return resp, nil
 }
@@ -101,7 +138,7 @@ func (c *Client) getPaginated(ctx context.Context, path string, params url.Value
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+c.token)
+		c.addAuth(req)
 		req.Header.Set("Accept", "application/json")
 
 		resp, err := c.httpClient.Do(req)
@@ -122,12 +159,16 @@ func (c *Client) getPaginated(ctx context.Context, path string, params url.Value
 			return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, body)
 		}
 
-		var page []json.RawMessage
-		if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
-			resp.Body.Close()
+		rawBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
 			return nil, err
 		}
-		resp.Body.Close()
+
+		var page []json.RawMessage
+		if err := json.Unmarshal(stripJSONPrefix(rawBody), &page); err != nil {
+			return nil, err
+		}
 		all = append(all, page...)
 
 		// Parse Link header for next page
@@ -148,7 +189,7 @@ func (c *Client) DownloadFile(ctx context.Context, fileURL string) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	c.addAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
