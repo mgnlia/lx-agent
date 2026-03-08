@@ -27,7 +27,8 @@ import (
 type config struct {
 	Canvas struct {
 		URL   string `yaml:"url"`
-		Token string `yaml:"token"`
+		Token         string `yaml:"token"`
+		SessionCookie string `yaml:"session_cookie"`
 	} `yaml:"canvas"`
 	Monitor struct {
 		PollInterval   string `yaml:"poll_interval"`
@@ -88,6 +89,15 @@ func main() {
 
 	ctx := context.Background()
 	client := canvas.NewClient(cfg.Canvas.URL, cfg.Canvas.Token, logger)
+
+	// If session cookie is provided, use it for auth (for SNU myETL which
+	// rejects Bearer tokens and requires session-based authentication).
+	if cfg.Canvas.SessionCookie != "" {
+		client.SetCookies([]*http.Cookie{
+			{Name: "_normandy_session", Value: cfg.Canvas.SessionCookie},
+			{Name: "_legacy_normandy_session", Value: cfg.Canvas.SessionCookie},
+		})
+	}
 
 	switch cmd {
 	case "courses":

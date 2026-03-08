@@ -1,7 +1,8 @@
 # lx-agent configuration
 canvas:
-  url: "learningx.snu.ac.kr"        # Canvas LMS base URL
+  url: "myetl.snu.ac.kr"            # Canvas LMS base URL (was learningx.snu.ac.kr)
   token: ""                          # API access token (Settings → New Access Token)
+  session_cookie: ""                 # Alternative: Normandy session cookie (for instances that reject Bearer tokens)
 
 monitor:
   poll_interval: "10m"               # How often to check for updates
